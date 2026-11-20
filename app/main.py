@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db
 from app.routers import zonas
+from app.routers import leads, zonas
 
 
 @asynccontextmanager
@@ -31,6 +32,7 @@ app.add_middleware(
 )
 
 app.include_router(zonas.router)
+app.include_router(leads.router)
 
 
 @app.get("/health")
