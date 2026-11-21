@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 EstadoCRM = Literal[
     "pendiente", "llamado", "seguimiento", "interesado", "cliente", "descartado"
@@ -27,6 +27,15 @@ class ExtraerZonaResponse(BaseModel):
     mensaje: str
 
 
+class AgregarZonaRequest(BaseModel):
+    lat: float = Field(..., description="Latitud dentro de Córdoba Capital")
+    lng: float = Field(..., description="Longitud dentro de Córdoba Capital")
+    barrio_id: int | None = Field(
+        default=None,
+        description="Barrio al que se asigna la celda (si es null, se usa 'Otras Zonas')",
+    )
+
+
 class ZonaEstadoResponse(BaseModel):
     h3_index: str
     barrio_id: int
@@ -35,6 +44,9 @@ class ZonaEstadoResponse(BaseModel):
     estado: str
     ultimo_scraping: datetime | None
     leads_count: int
+    rubros_scrapeados: list[str] = Field(default_factory=list)
+    porcentaje_escaneo: float = 0.0
+    saturada: bool = False
 
 
 # --- Barrios y Mapa ---
@@ -61,6 +73,9 @@ class CeldaMapaOut(BaseModel):
     estado: str
     ultimo_scraping: datetime | None
     leads_count: int
+    rubros_scrapeados: list[str] = Field(default_factory=list)
+    porcentaje_escaneo: float = 0.0
+    saturada: bool = False
 
 
 # --- Leads y CRM ---
@@ -116,6 +131,13 @@ class LeadUpdate(BaseModel):
     instagram: str | None = None
     website: str | None = None
 
+    @field_validator("proximo_contacto", mode="before")
+    @classmethod
+    def _empty_date_to_none(cls, v):
+        if v == "":
+            return None
+        return v
+
 
 class ReferidoCreate(BaseModel):
     nombre: str = Field(..., min_length=1, max_length=255)
@@ -127,3 +149,10 @@ class ReferidoCreate(BaseModel):
     barrio_id: int | None = None
     notas: str | None = None
     proximo_contacto: date | None = None
+
+    @field_validator("proximo_contacto", mode="before")
+    @classmethod
+    def _empty_date_to_none(cls, v):
+        if v == "":
+            return None
+        return v

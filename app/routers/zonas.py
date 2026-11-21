@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import logging
 
+import h3
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal, get_db
 from app.models import Barrio, Lead, ZonaH3
 from app.schemas import (
+    AgregarZonaRequest,
     BarrioAvanceOut,
     CeldaMapaOut,
     ExtraerZonaRequest,
@@ -21,6 +23,53 @@ from app.services.phone_parser import parse_cordoba_phone
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["Zonas y Barrios"])
+
+# Límites geográficos de Córdoba Capital (anillo Circunvalación + barrios periféricos)
+CORDOBA_LAT_MIN = -31.54
+CORDOBA_LAT_MAX = -31.30
+CORDOBA_LNG_MIN = -64.33
+CORDOBA_LNG_MAX = -64.05
+
+# 6 pasadas objetivo por hexágono para considerar 100% escaneado
+RUBROS_OBJETIVO = [
+    "general",
+    "cafe",
+    "barberia",
+    "restaurante",
+    "gimnasio",
+    "kiosco",
+]
+
+
+def _latlng_to_h3(lat: float, lng: float, res: int = 9) -> str:
+    if hasattr(h3, "latlng_to_cell"):
+        return h3.latlng_to_cell(lat, lng, res)
+    return h3.geo_to_h3(lat, lng, res)
+
+
+def _h3_to_center_and_polygon(h3_index: str) -> tuple[float, float, list[list[float]]]:
+    if hasattr(h3, "cell_to_latlng"):
+        lat, lng = h3.cell_to_latlng(h3_index)
+        boundary = h3.cell_to_boundary(h3_index)
+    else:
+        lat, lng = h3.h3_to_geo(h3_index)
+        boundary = h3.h3_to_geo_boundary(h3_index)
+    poligono = [[float(p[0]), float(p[1])] for p in boundary]
+    return float(lat), float(lng), poligono
+
+
+def _normalizar_rubro_key(rubro: str | None) -> str:
+    if not rubro or not rubro.strip():
+        return "general"
+    return rubro.strip().lower()
+
+
+def _calcular_porcentaje_escaneo(rubros_scrapeados: list[str] | None) -> float:
+    if not rubros_scrapeados:
+        return 0.0
+    unicos = {r.strip().lower() for r in rubros_scrapeados if r and r.strip()}
+    pct = (len(unicos) / len(RUBROS_OBJETIVO)) * 100
+    return round(min(100.0, pct), 1)
 
 
 def _map_apify_item_to_lead(item: dict, h3_index: str, barrio_id: int) -> dict | None:
@@ -74,6 +123,9 @@ async def _ejecutar_extraccion_zona(
             radius_km=radius_km,
         )
 
+        # Si Apify llegó al tope pedido, probablemente quedaron comercios afuera
+        toco_techo = len(raw_places) >= max_results
+
         deduped: dict[str, dict] = {}
         for item in raw_places:
             mapped = _map_apify_item_to_lead(item, h3_index, barrio_id)
@@ -81,6 +133,7 @@ async def _ejecutar_extraccion_zona(
                 deduped[mapped["google_place_id"]] = mapped
 
         leads_list = await enrich_leads_batch(list(deduped.values()))
+        rubro_key = _normalizar_rubro_key(rubro)
 
         async with AsyncSessionLocal() as session:
             if leads_list:
@@ -93,11 +146,23 @@ async def _ejecutar_extraccion_zona(
 
             zona = await session.get(ZonaH3, h3_index)
             if zona:
+                actuales = list(zona.rubros_scrapeados or [])
+                if rubro_key not in actuales:
+                    actuales.append(rubro_key)
+                # Asignamos lista nueva para que SQLAlchemy marque la columna JSON como modificada
+                zona.rubros_scrapeados = actuales
+                zona.saturada = bool(zona.saturada or toco_techo)
                 zona.estado = "scrapeado"
                 zona.ultimo_scraping = datetime.now(timezone.utc)
 
             await session.commit()
-            logger.info("Celda %s scrapeada: %d lugares procesados", h3_index, len(leads_list))
+            logger.info(
+                "Celda %s scrapeada (rubro=%s): %d lugares, saturada=%s",
+                h3_index,
+                rubro_key,
+                len(leads_list),
+                toco_techo,
+            )
 
     except Exception:
         logger.exception("Error extrayendo celda %s", h3_index)
@@ -196,12 +261,86 @@ async def listar_celdas_barrio(barrio_id: int, db: AsyncSession = Depends(get_db
             estado=zona.estado,
             ultimo_scraping=zona.ultimo_scraping,
             leads_count=int(leads_count or 0),
+            rubros_scrapeados=list(zona.rubros_scrapeados or []),
+            porcentaje_escaneo=_calcular_porcentaje_escaneo(zona.rubros_scrapeados),
+            saturada=bool(zona.saturada),
         )
         for zona, leads_count in rows
     ]
 
 
 # --- Endpoints de Celdas H3 ---
+
+
+@router.post(
+    "/zonas/agregar",
+    response_model=CeldaMapaOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def agregar_zona(
+    body: AgregarZonaRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    if not (
+        CORDOBA_LAT_MIN <= body.lat <= CORDOBA_LAT_MAX
+        and CORDOBA_LNG_MIN <= body.lng <= CORDOBA_LNG_MAX
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Las coordenadas seleccionadas están fuera de Córdoba Capital",
+        )
+
+    h3_index = _latlng_to_h3(body.lat, body.lng, res=9)
+    existente = await db.get(ZonaH3, h3_index)
+    if existente:
+        raise HTTPException(
+            status_code=409,
+            detail=f"El hexágono {h3_index} ya existe en el mapa",
+        )
+
+    # Si mandan barrio_id lo validamos; si no, usamos/creamos "Otras Zonas"
+    if body.barrio_id is not None:
+        barrio = await db.get(Barrio, body.barrio_id)
+        if not barrio:
+            raise HTTPException(status_code=404, detail="Barrio no encontrado")
+    else:
+        barrio = (
+            await db.execute(select(Barrio).where(Barrio.nombre == "Otras Zonas"))
+        ).scalar_one_or_none()
+        if not barrio:
+            barrio = Barrio(nombre="Otras Zonas", geojson_poligono={})
+            db.add(barrio)
+            await db.flush()
+
+    lat_c, lng_c, poligono = _h3_to_center_and_polygon(h3_index)
+
+    nueva_zona = ZonaH3(
+        h3_index=h3_index,
+        barrio_id=barrio.id,
+        lat_centro=lat_c,
+        lng_centro=lng_c,
+        poligono_json=poligono,
+        estado="pendiente",
+        rubros_scrapeados=[],
+        saturada=False,
+    )
+    db.add(nueva_zona)
+    await db.commit()
+    await db.refresh(nueva_zona)
+
+    return CeldaMapaOut(
+        h3_index=nueva_zona.h3_index,
+        barrio_id=nueva_zona.barrio_id,
+        lat_centro=nueva_zona.lat_centro,
+        lng_centro=nueva_zona.lng_centro,
+        poligono_json=nueva_zona.poligono_json,
+        estado=nueva_zona.estado,
+        ultimo_scraping=nueva_zona.ultimo_scraping,
+        leads_count=0,
+        rubros_scrapeados=[],
+        porcentaje_escaneo=0.0,
+        saturada=False,
+    )
 
 
 @router.get("/zonas/{h3_index}", response_model=ZonaEstadoResponse)
@@ -221,6 +360,9 @@ async def obtener_estado_zona(h3_index: str, db: AsyncSession = Depends(get_db))
         estado=zona.estado,
         ultimo_scraping=zona.ultimo_scraping,
         leads_count=leads_count or 0,
+        rubros_scrapeados=list(zona.rubros_scrapeados or []),
+        porcentaje_escaneo=_calcular_porcentaje_escaneo(zona.rubros_scrapeados),
+        saturada=bool(zona.saturada),
     )
 
 

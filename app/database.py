@@ -3,6 +3,7 @@ from collections.abc import AsyncGenerator
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import text
 
 load_dotenv()
 
@@ -46,3 +47,23 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                "ALTER TABLE zonas_h3 "
+                "ADD COLUMN IF NOT EXISTS rubros_scrapeados JSON NOT NULL DEFAULT '[]'::json"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE zonas_h3 "
+                "ADD COLUMN IF NOT EXISTS saturada BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+        # Backfill para celdas que ya scrapeaste antes de agregar estas columnas
+        await conn.execute(
+            text(
+                "UPDATE zonas_h3 "
+                "SET rubros_scrapeados = '[\"general\"]'::json "
+                "WHERE estado = 'scrapeado' AND rubros_scrapeados::text = '[]'"
+            )
+        )

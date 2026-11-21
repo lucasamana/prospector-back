@@ -2,17 +2,24 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import update
 
-from app.database import init_db
-from app.routers import zonas
+from app.database import AsyncSessionLocal, init_db
+from app.models import ZonaH3
 from app.routers import leads, zonas
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(ZonaH3)
+            .where(ZonaH3.estado == "procesando")
+            .values(estado="error")
+        )
+        await session.commit()
     yield
-
 
 app = FastAPI(
     title="Prospector Córdoba API",

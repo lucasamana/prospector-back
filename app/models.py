@@ -2,6 +2,7 @@ from datetime import date, datetime
 from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, JSON, String, Text, func
 
 from app.database import Base
 
@@ -17,7 +18,6 @@ class Barrio(Base):
         back_populates="barrio", cascade="all, delete-orphan"
     )
     leads: Mapped[list["Lead"]] = relationship(back_populates="barrio")
-
 
 class ZonaH3(Base):
     __tablename__ = "zonas_h3"
@@ -38,8 +38,13 @@ class ZonaH3(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    rubros_scrapeados: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    saturada: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     barrio: Mapped["Barrio"] = relationship(back_populates="celdas")
     leads: Mapped[list["Lead"]] = relationship(back_populates="zona")
+
+    
 
 
 class Lead(Base):
